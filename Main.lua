@@ -112,7 +112,7 @@ function Module.CreateChase(character, agentRadius, canJump, range, costs, canRo
             end
 
             if entity.CanRoam then
-                -- Lógica de Roam simplificada aqui
+                -- Well...
                 task.wait(1)
             else
                 task.wait(0.5)
