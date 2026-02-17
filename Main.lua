@@ -1,11 +1,9 @@
 local Module = {}
 local PathfindingService = game:GetService("PathfindingService")
 
--- Constantes para facilitar ajustes
 local MAX_ROAM_ATTEMPTS = 5
 local DEFAULT_UPDATE_TIME = 2
 
--- Tabela de distâncias (Ordenada do maior para o menor para busca rápida)
 local Thresholds = {
     {dist = 8,  interval = 0.1},
     {dist = 15, interval = 0.35},
@@ -21,7 +19,6 @@ local function CalculateUpdateTime(distance)
     return DEFAULT_UPDATE_TIME
 end
 
--- Função para limpar threads com segurança
 local function StopCurrentThread(entity)
     if entity.Thread then
         task.cancel(entity.Thread)
@@ -36,7 +33,6 @@ local function FollowWaypoints(entity, waypoints)
     StopCurrentThread(entity)
 
     entity.Thread = task.spawn(function()
-        -- Começamos do waypoint 2 ou 3 para evitar travamentos no lugar
         for i = 2, #waypoints do
             local wp = waypoints[i]
             
@@ -46,20 +42,20 @@ local function FollowWaypoints(entity, waypoints)
                 humanoid.Jump = true
             end
 
-            -- Espera chegar no ponto ou dar timeout
+            
             local reached = false
             local connection
             connection = humanoid.MoveToFinished:Connect(function()
                 reached = true
             end)
 
-            -- Timeout de segurança caso o NPC fique preso
+           
             local start = os.clock()
             repeat task.wait() until reached or (os.clock() - start) > 1
             
             if connection then connection:Disconnect() end
             
-            -- Se demorou demais, pula para tentar desentalar
+         
             if (os.clock() - start) > 1 then
                 humanoid.Jump = true
             end
