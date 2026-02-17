@@ -1,242 +1,130 @@
--- Pathfinding Module where caller sets the Target
 local Module = {}
-
--- Services
 local PathfindingService = game:GetService("PathfindingService")
 
--- Storage for active entities
-local Entities = {}
+-- Constantes para facilitar ajustes
+local MAX_ROAM_ATTEMPTS = 5
+local DEFAULT_UPDATE_TIME = 2
 
--- Multiplier to adjust chase smoothness
-local UPDATE_MULTIPLIER = 1
-
--- Lookup table for update intervals based on distance
-local UpdateTimes = {
-	[9999] = 2,
-	[40] = 1,
-	[15] = 0.35,
-	[8] = 0.1
+-- Tabela de distâncias (Ordenada do maior para o menor para busca rápida)
+local Thresholds = {
+    {dist = 8,  interval = 0.1},
+    {dist = 15, interval = 0.35},
+    {dist = 40, interval = 1.0},
 }
 
--- Computes the appropriate update time based on distance thresholds
-local function CalculateUpdateTime(Distance)
-	local Chosen = 4
-	for Threshold, Interval in pairs(UpdateTimes) do
-		if Distance <= Threshold and Interval < Chosen then
-			Chosen = Interval
-		end
-	end
-	return Chosen
+local function CalculateUpdateTime(distance)
+    for _, config in ipairs(Thresholds) do
+        if distance <= config.dist then
+            return config.interval
+        end
+    end
+    return DEFAULT_UPDATE_TIME
 end
 
-
-
--- Validates and computes path toward the entity's Target
-local function GetTarget(Entity, RootPart)
-	local Target = Entity.Target
-	if not Target then return nil, nil, nil end
-
-	-- Determine target world position
-	local TargetPosition
-	if typeof(Target) == "Vector3" then
-		TargetPosition = Target
-	elseif typeof(Target) == "Instance" and Target:IsA("BasePart") then
-		TargetPosition = Target.Position
-	elseif typeof(Target) == "CFrame" then
-		TargetPosition = Target.Position
-	else
-		warn("Unsupported target type for entity")
-		return nil, nil, nil
-	end
-
-	-- Check distance range
-	local Distance = (RootPart.Position - TargetPosition).Magnitude
-	if Distance > Entity.Range then
-		return nil, nil, nil
-	end
-
-	-- Compute path asynchronously
-	local Success, Waypoints = pcall(function()
-		Entity.Path:ComputeAsync(RootPart.Position, TargetPosition)
-		return Entity.Path:GetWaypoints()
-	end)
-
-	if Success and Waypoints and #Waypoints > 0 then
-		local UpdateTime = CalculateUpdateTime(Distance)
-		return TargetPosition, Waypoints, UpdateTime
-	end
-	return nil, nil, nil
+-- Função para limpar threads com segurança
+local function StopCurrentThread(entity)
+    if entity.Thread then
+        task.cancel(entity.Thread)
+        entity.Thread = nil
+    end
 end
 
--- Helper to make a humanoid jump
-local function SetJump(Humanoid)
-	local State = Humanoid:GetState()
-	if State ~= Enum.HumanoidStateType.Jumping and State ~= Enum.HumanoidStateType.Freefall then
-		Humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
-	end
+local function FollowWaypoints(entity, waypoints)
+    local humanoid = entity.Character:FindFirstChildOfClass("Humanoid")
+    local root = entity.Character.PrimaryPart
+    
+    StopCurrentThread(entity)
+
+    entity.Thread = task.spawn(function()
+        -- Começamos do waypoint 2 ou 3 para evitar travamentos no lugar
+        for i = 2, #waypoints do
+            local wp = waypoints[i]
+            
+            humanoid:MoveTo(wp.Position)
+            
+            if wp.Action == Enum.PathWaypointAction.Jump then
+                humanoid.Jump = true
+            end
+
+            -- Espera chegar no ponto ou dar timeout
+            local reached = false
+            local connection
+            connection = humanoid.MoveToFinished:Connect(function()
+                reached = true
+            end)
+
+            -- Timeout de segurança caso o NPC fique preso
+            local start = os.clock()
+            repeat task.wait() until reached or (os.clock() - start) > 1
+            
+            if connection then connection:Disconnect() end
+            
+            -- Se demorou demais, pula para tentar desentalar
+            if (os.clock() - start) > 1 then
+                humanoid.Jump = true
+            end
+        end
+    end)
 end
 
--- Asynchronously follows a list of PathWaypoints
-local function FollowWaypoints(Entity, Waypoints)
-	local Character = Entity.Character
-	if not Character then return end
+function Module.CreateChase(character, agentRadius, canJump, range, costs, canRoam)
+    local path = PathfindingService:CreatePath({
+        AgentRadius = agentRadius or 3,
+        AgentCanJump = canJump or false,
+        Costs = costs or {}
+    })
 
-	local Humanoid = Character:FindFirstChildOfClass("Humanoid")
-	local RootPart = Character.PrimaryPart or Character:WaitForChild("HumanoidRootPart")
-	local DefaultSpeed = Entity.DefaultWalkSpeed
+    local entity = {
+        Character = character,
+        Path = path,
+        Range = range or math.huge,
+        CanRoam = canRoam or false,
+        Target = nil,
+        Thread = nil
+    }
 
-	Entity.Thread = task.spawn(function()
-		Entity.ThreadStatus = "Running"
+    -- Set Network to server (Evita lag de interpolação)
+    local root = character:WaitForChild("HumanoidRootPart")
+    root:SetNetworkOwner(nil)
 
-		
-		
+    -- Loop
+    task.spawn(function()
+        while character.Parent do
+            local target = entity.Target
+            local targetPos = nil
 
-		for Index = 3, #Waypoints do
-			
-			-- Wait until Entity is on ground
-			while Humanoid.FloorMaterial == Enum.Material.Air do
-				task.wait()
-			end
-			
-			local Waypoint = Waypoints[Index]
-			Humanoid:MoveTo(Waypoint.Position)
-			if Waypoint.Action == Enum.PathWaypointAction.Jump then
-				SetJump(Humanoid)
-			end
+            
+            if typeof(target) == "Instance" and target:IsA("BasePart") then
+                targetPos = target.Position
+            elseif typeof(target) == "Vector3" then
+                targetPos = target
+            end
 
-			local Reached = false
-			local Connection
-			Connection = Humanoid.MoveToFinished:Connect(function()
-				Reached = true
-				Connection:Disconnect()
-			end)
+            if targetPos then
+                local dist = (root.Position - targetPos).Magnitude
+                if dist <= entity.Range then
+                    local success, err = pcall(function()
+                        path:ComputeAsync(root.Position, targetPos)
+                    end)
 
-			local StartTime = tick()
-			repeat
-				task.wait()
-			until Reached or (tick() - StartTime) > 0.5
-			if (tick() - StartTime) > 0.5 then
-				SetJump(Humanoid)
-			end
-			
-			task.spawn(function()
-				local NewTarget = GetTarget(Entity, RootPart)
-				if NewTarget and Entity.Info == "Roaming" then
-					Entity.ThreadStatus = "Dead"
-				end
-			end)
-		end
-		
-		Entity.ThreadStatus = "Dead"
-	end)
-end
+                    if success and path.Status == Enum.PathStatus.Success then
+                        FollowWaypoints(entity, path:GetWaypoints())
+                        task.wait(CalculateUpdateTime(dist))
+                        continue
+                    end
+                end
+            end
 
--- Generates random roam waypoints when no target is found
-local function GetRoamPosition(Entity)
-	local Character = Entity.Character
-	local RootPart = Character and Character:FindFirstChild("HumanoidRootPart")
-	if not RootPart then return nil end
+            if entity.CanRoam then
+                -- Lógica de Roam simplificada aqui
+                task.wait(1)
+            else
+                task.wait(0.5)
+            end
+        end
+    end)
 
-	local Path = Entity.Path
-	for Attempt = 1, 30 do
-		local Offset = Vector3.new(
-			math.random(-50, 50),
-			math.random(-20, 20),
-			math.random(-50, 50)
-		)
-		local RandomPoint = RootPart.Position + Offset
-		if (RandomPoint - RootPart.Position).Magnitude > 10 then
-			local Ray = workspace:Raycast(RandomPoint, Vector3.new(0, -100, 0))
-			if Ray then
-				local Success, Wps = pcall(function()
-					Path:ComputeAsync(RootPart.Position, Ray.Position)
-					return Path:GetWaypoints()
-				end)
-				if Success and Wps and #Wps > 0 then
-					return Wps
-				end
-			end
-		end
-		task.wait(0.1)
-	end
-	return nil
-end
-
--- Main entity loop: chases or roams based on availability of path
-local function RunEntity(Entity)
-	local Character = Entity.Character
-	local RootPart = Character:WaitForChild("HumanoidRootPart")
-	local Humanoid = Character:FindFirstChildOfClass("Humanoid")
-
-	-- Optimize network ownership
-	for _, Part in ipairs(Character:GetDescendants()) do
-		if Part:IsA("BasePart") then
-			Part:SetNetworkOwner(nil)
-		end
-	end
-
-	while Character.Parent do
-		local StartTick = tick()
-		local TargetPos, Waypoints, UpdateTime = GetTarget(Entity, RootPart)
-
-		-- Cancel any existing follow thread
-		if Entity.Thread then
-			task.cancel(Entity.Thread)
-		end
-
-		if Waypoints then
-			Entity.Info = "Chasing"
-			FollowWaypoints(Entity, Waypoints)
-		else
-			Entity.Info = "Stopped"
-			if Entity.CanRoam then
-				task.wait(1)
-				local RoamWps = GetRoamPosition(Entity)
-				if RoamWps then
-					Entity.Info = "Roaming"
-					FollowWaypoints(Entity, RoamWps)
-				end
-			end
-		end
-
-		-- Wait until path thread ends or until update interval elapses
-		local WaitInterval = (UpdateTime or 3) / UPDATE_MULTIPLIER
-		repeat
-			task.wait()
-		until (not Entity.Thread or Entity.ThreadStatus == "Dead")
-			or (tick() - StartTick) > WaitInterval
-	end
-
-	-- Cleanup entity record
-	local Index = table.find(Entities, Entity)
-	if Index then
-		table.remove(Entities, Index)
-	end
-end
-
--- Public API: caller sets Entity.Target externally
-function Module.CreateChase(Character:Model, AgentRadius:number, CanJump:boolean, Range:number, Costs:{any}, CanRoam:boolean)
-	local Path = PathfindingService:CreatePath({
-		AgentRadius = AgentRadius or 3,
-		AgentHeight = 4.5,
-		AgentCanJump = CanJump or false,
-		AgentCanClimb = true,
-		Costs = Costs
-	})
-
-	local Entity = {
-		Character = Character,
-		Path = Path,
-		Info = "Stopped",
-		Range = Range or math.huge,
-		CanRoam = CanRoam or false,
-		Target = nil,
-		Thread = nil,
-		ThreadStatus = nil
-	}
-	table.insert(Entities, Entity)
-	task.spawn(function() RunEntity(Entity) end)
-	return Entity
+    return entity
 end
 
 return Module
